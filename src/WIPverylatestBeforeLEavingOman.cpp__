@@ -2,7 +2,7 @@
   ESP32 -> SmartSDR CAT (Kenwood FA) + Encoders + Preferences + Auto-Discover
   + 5x TTP223 Touch Inputs (active-HIGH, idle LOW) with simple debounce
   + 2x Encoder Click Buttons (active-LOW with INPUT_PULLUP) with simple debounce
-/*
+
   TTP223 wiring:
   - VCC = 3.3V, GND = GND, OUT -> GPIO (18/19/21/22/23 here)
   - Pins are set to INPUT_PULLDOWN (idle LOW). Touch drives them HIGH.
