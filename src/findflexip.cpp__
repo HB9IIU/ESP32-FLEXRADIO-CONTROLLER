@@ -1,0 +1,224 @@
+/*
+  ESP32 SmartSDR CAT auto-discover + cache (robust) + STATUS LED
+  LED: fast blink = scanning / not connected
+       slow blink = connected (CAT host confirmed)
+*/
+
+#include <WiFi.h>
+#include <Preferences.h>
+
+// ====== STATUS LED ======
+#ifndef LED_PIN
+#define LED_PIN 2          // change if your LED is on another pin
+#endif
+
+enum LedMode { LED_OFF, LED_BLINK_SLOW, LED_BLINK_FAST };
+static LedMode g_ledMode = LED_OFF;
+static bool     g_ledState = false;
+static uint32_t g_ledLast  = 0;
+
+void ledInit() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  g_ledMode = LED_OFF;
+  g_ledState = false;
+  g_ledLast  = 0;
+}
+void ledSet(LedMode m) {
+  g_ledMode = m;
+  g_ledLast = 0;
+}
+void ledUpdate() {
+  uint32_t now = millis();
+  uint32_t period = 0;
+  if      (g_ledMode == LED_BLINK_FAST) period = 150;   // fast
+  else if (g_ledMode == LED_BLINK_SLOW) period = 600;   // slow
+
+  if (period) {
+    if (now - g_ledLast >= period) {
+      g_ledLast = now;
+      g_ledState = !g_ledState;
+      digitalWrite(LED_PIN, g_ledState ? HIGH : LOW);
+    }
+  } else {
+    if (g_ledState) { g_ledState = false; digitalWrite(LED_PIN, LOW); }
+  }
+}
+// non-blocking-ish delay that keeps LED blinking
+void sleepWithLED(uint32_t ms) {
+  uint32_t start = millis();
+  while (millis() - start < ms) {
+    ledUpdate();
+    delay(5);
+  }
+}
+
+// ====== WiFi ======
+const char* ssid = "NO WIFI FOR YOU!!!";
+const char* pass = "Nestle2010Nestle";
+
+// ====== CAT ======
+const uint16_t CAT_PORT = 5002;
+
+// ====== timeouts ======
+const uint32_t TCP_CONNECT_TIMEOUT_MS = 100;   // per attempt
+const uint32_t CAT_READ_TIMEOUT_MS    = 1200;  // FA; reply wait
+
+// ====== retry/backoff for cached host ======
+const uint8_t  CACHED_TRIES        = 4;
+const uint32_t CACHED_BACKOFF_MS[] = {200, 400, 800, 1200};
+
+// ====== scan pacing ======
+const uint32_t SCAN_START_DELAY_MS = 1200;  // pause before scanning (let CAT wake)
+const uint8_t  SCAN_BREATHER_MS    = 6;
+
+// ====== NVS ======
+Preferences prefs;
+const char* PREF_NS   = "cat";
+const char* PREF_HOST = "host";
+
+static inline uint32_t ipToU32(IPAddress ip){
+  return (uint32_t(ip[0])<<24)|(uint32_t(ip[1])<<16)|(uint32_t(ip[2])<<8)|uint32_t(ip[3]);
+}
+static inline IPAddress u32ToIp(uint32_t u){
+  return IPAddress((u>>24)&0xFF,(u>>16)&0xFF,(u>>8)&0xFF,u&0xFF);
+}
+
+bool queryFAOnce(WiFiClient& sock){
+  sock.setTimeout(CAT_READ_TIMEOUT_MS);
+  Serial.println("[CAT] Querying FA;");
+  if (sock.print("FA;") != 3) { Serial.println("[CAT] Short write."); return false; }
+  String line = sock.readStringUntil(';');
+  if (line.length() == 0) { Serial.println("[CAT] No reply to FA;"); return false; }
+  line += ';';
+  Serial.print("<< "); Serial.println(line);
+  return true;
+}
+
+// Try connecting to host; optionally confirm with FA;
+bool tryHost(IPAddress host, bool confirmFA){
+  Serial.print("[CAT] Trying host "); Serial.print(host); Serial.print(" ... ");
+  WiFiClient c; // fresh client each try
+  if (!c.connect(host, CAT_PORT, TCP_CONNECT_TIMEOUT_MS)) {
+    Serial.println("connect FAIL");
+    return false;
+  }
+  Serial.println("connect OK");
+  if (!confirmFA) { c.stop(); return true; }
+
+  bool ok = queryFAOnce(c);
+  c.stop();
+  return ok;
+}
+
+// Scan current subnet, stop at first OPEN
+bool scanFirstOpen(IPAddress& found){
+  IPAddress myIP = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+  uint32_t uIP   = ipToU32(myIP);
+  uint32_t uMask = ipToU32(mask);
+  uint32_t uNet  = uIP & uMask;
+  uint32_t uBrd  = uNet | (~uMask);
+
+  Serial.print("[SCAN] IP: "); Serial.print(myIP);
+  Serial.print("  Mask: "); Serial.print(mask);
+  Serial.print("  Network: "); Serial.print(u32ToIp(uNet));
+  Serial.print("  Broadcast: "); Serial.println(u32ToIp(uBrd));
+
+  sleepWithLED(SCAN_START_DELAY_MS); // give CAT a moment to reopen listener
+
+  for (uint32_t u = uNet + 1; u <= uBrd - 1; ++u){
+    IPAddress target = u32ToIp(u);
+    if (target == myIP) continue;
+
+    Serial.print("[SCAN] Testing "); Serial.print(target); Serial.print(" ... ");
+    WiFiClient probe;
+    bool ok = probe.connect(target, CAT_PORT, TCP_CONNECT_TIMEOUT_MS);
+    if (ok){
+      probe.stop();
+      Serial.println("OPEN");
+      found = target;
+      return true; // stop at first open
+    } else {
+      Serial.println("closed");
+    }
+    // keep LED responsive between probes
+    sleepWithLED(SCAN_BREATHER_MS);
+  }
+  return false;
+}
+
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== ESP32 SmartSDR CAT Auto-Discover + Cache (robust) + LED ===");
+
+  ledInit();
+  ledSet(LED_BLINK_FAST); // start in "searching" state
+
+  Serial.println("[WiFi] Connecting...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000){
+    ledUpdate();
+    delay(50);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() != WL_CONNECTED){
+    Serial.println("[WiFi] FAILED.");
+    sleepWithLED(1000);
+    ESP.restart();
+  }
+  Serial.print("[WiFi] Connected. IP: "); Serial.println(WiFi.localIP());
+
+  prefs.begin(PREF_NS, false);
+  String cached = prefs.getString(PREF_HOST, "");
+  if (cached.length()){
+    IPAddress ip; ip.fromString(cached);
+    Serial.print("[CACHE] Found cached CAT host: "); Serial.println(ip);
+
+    bool ok = false;
+    for (uint8_t i=0; i<CACHED_TRIES && !ok; ++i){
+      ok = tryHost(ip, /*confirmFA=*/true);
+      if (!ok){
+        uint32_t backoff = CACHED_BACKOFF_MS[min<size_t>(i, sizeof(CACHED_BACKOFF_MS)/sizeof(CACHED_BACKOFF_MS[0])-1)];
+        Serial.printf("[CACHE] Retry %u/%u in %u ms...\n", i+1, CACHED_TRIES, backoff);
+        sleepWithLED(backoff);
+      }
+    }
+    if (ok){
+      Serial.println("[CACHE] Cached host confirmed. Done.");
+      ledSet(LED_BLINK_SLOW);   // connected → slow blink
+      prefs.end();
+      return;
+    }
+    Serial.println("[CACHE] Cached host failed after retries. Will scan.");
+  } else {
+    Serial.println("[CACHE] No cached CAT host. Will scan.");
+  }
+
+  IPAddress found;
+  if (!scanFirstOpen(found)){
+    Serial.println("[SCAN] No CAT (TCP 5002) found on subnet.");
+    prefs.end();
+    sleepWithLED(1000); // flush & show LED
+    ESP.restart();
+  }
+
+  // Confirm with FA; before saving
+  if (tryHost(found, /*confirmFA=*/true)){
+    Serial.print("[SAVE] Storing CAT host: "); Serial.println(found);
+    prefs.putString(PREF_HOST, found.toString());
+    ledSet(LED_BLINK_SLOW);     // connected → slow blink
+  } else {
+    Serial.println("[SAVE] Found host didn’t reply to FA;, not saving.");
+    // remain in fast blink (searching) state
+  }
+  prefs.end();
+}
+
+void loop(){
+  ledUpdate(); // keep the status LED ticking
+}

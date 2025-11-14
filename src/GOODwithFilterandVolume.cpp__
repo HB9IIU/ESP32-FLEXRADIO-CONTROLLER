@@ -1,0 +1,409 @@
+/*
+  ESP32 -> SmartSDR CAT (Kenwood FA) + Optical Encoder (interrupt, smooth)
+  + Preferences cache + IP auto-discover (cached -> default -> fast scan)
+  + SECOND ENCODER: RX filter preset (ZZFI00..07)
+  + THIRD  ENCODER: VFO A volume 0..100 using Flex ZZAGnnn;
+  + Volume step per detent via VOLUME_STEP
+  Serial: 115200
+*/
+
+#include <WiFi.h>
+#include <Preferences.h>
+
+// ===== YOUR SETTINGS =====
+const char* WIFI_SSID = "NO WIFI FOR YOU!!!";
+const char* WIFI_PASS = "Nestle2010Nestle";
+const IPAddress CAT_HOST(192,168,0,5);   // fallback if no cache / cache fails
+const uint16_t  CAT_PORT = 5002;
+// =========================
+
+// --- discovery timeouts (fast) ---
+const uint32_t TCP_CONNECT_TIMEOUT_MS = 150;
+const uint32_t SCAN_START_DELAY_MS    = 800;
+const uint8_t  SCAN_BREATHER_MS       = 6;
+
+// ---- MAIN ENCODER (frequency) ----
+const int PIN_ENC_A = 32;
+const int PIN_ENC_B = 33;
+
+// ---- FILTER ENCODER (preset 0..7) ----
+const int PIN_FILT_A = 25;
+const int PIN_FILT_B = 26;
+
+// ---- VOLUME ENCODER ----
+const int PIN_VOL_A  = 27;
+const int PIN_VOL_B  = 14;
+
+// ---- VOLUME STEP (percent per detent) ----
+const int VOLUME_STEP = 5;   // change to 2/5/10 as you like
+
+#define ENC_INPUT_MODE INPUT_PULLUP
+
+// Frequency step/behavior
+const int32_t  STEP_HZ          = 1;
+const uint32_t SEND_INTERVAL_MS = 60;
+const uint32_t RESYNC_MS        = 800;
+const uint32_t ACCEL_T1_MS      = 35;
+const uint32_t ACCEL_T2_MS      = 80;
+
+WiFiClient cat;
+Preferences prefs;
+IPAddress currentHost = CAT_HOST;
+
+uint32_t vfoHz = 14110000, lastSentHz = vfoHz;
+
+// ---------- Quadrature decoder (ISR) : MAIN ----------
+static const int8_t QDEC_TAB[16] = {
+  0,-1,+1,0, +1,0,0,-1, -1,0,0,+1, 0,+1,-1,0
+};
+
+volatile uint8_t  q_last = 0;
+volatile int32_t  q_edges = 0;
+volatile uint32_t lastDetentMs = 0;
+volatile int32_t  detentPending = 0;
+volatile bool     needResetEncoderBaseline = false;
+
+inline uint8_t fastReadAB() {
+  return (uint8_t(digitalRead(PIN_ENC_A)) << 1) | uint8_t(digitalRead(PIN_ENC_B));
+}
+
+void IRAM_ATTR encISR() {
+  uint8_t now = fastReadAB();
+  uint8_t idx = (q_last << 2) | now;
+  int8_t d = QDEC_TAB[idx];
+  if (d) {
+    q_edges += d;
+    detentPending += d;
+    if (detentPending >= 4 || detentPending <= -4) {
+      lastDetentMs = millis();
+      detentPending = 0;
+    }
+  }
+  q_last = now;
+}
+
+// ---------- FILTER ENCODER ----------
+volatile uint8_t  f_q_last = 0;
+volatile int32_t  f_edges  = 0;
+int8_t            filterIdx = 0;  // 0..7
+
+inline uint8_t fastReadAB_filt() {
+  return (uint8_t(digitalRead(PIN_FILT_A)) << 1) | uint8_t(digitalRead(PIN_FILT_B));
+}
+
+void IRAM_ATTR filtISR() {
+  uint8_t now = fastReadAB_filt();
+  uint8_t idx = (f_q_last << 2) | now;
+  int8_t d = QDEC_TAB[idx];
+  if (d) f_edges += d;
+  f_q_last = now;
+}
+
+// ---------- VOLUME ENCODER ----------
+volatile uint8_t  v_q_last = 0;
+volatile int32_t  v_edges  = 0;
+int16_t           volumePct = 50; // 0..100
+
+inline uint8_t fastReadAB_vol() {
+  return (uint8_t(digitalRead(PIN_VOL_A)) << 1) | uint8_t(digitalRead(PIN_VOL_B));
+}
+
+void IRAM_ATTR volISR() {
+  uint8_t now = fastReadAB_vol();
+  uint8_t idx = (v_q_last << 2) | now;
+  int8_t d = QDEC_TAB[idx];
+  if (d) v_edges += d;
+  v_q_last = now;
+}
+
+// ---------- Discovery helpers ----------
+static bool tryConnectQuick(IPAddress host) {
+  WiFiClient probe;
+  bool ok = probe.connect(host, CAT_PORT, TCP_CONNECT_TIMEOUT_MS);
+  probe.stop();
+  return ok;
+}
+
+static bool scanFirstOpen(IPAddress& found) {
+  IPAddress me = WiFi.localIP();
+  IPAddress net(me[0], me[1], me[2], 0);
+  delay(SCAN_START_DELAY_MS);
+  for (int last = 1; last <= 254; last++) {
+    if (last == (int)me[3]) continue;
+    IPAddress ip(net[0], net[1], net[2], last);
+    if (tryConnectQuick(ip)) { found = ip; return true; }
+    delay(SCAN_BREATHER_MS);
+  }
+  return false;
+}
+
+// ---------- Wi-Fi / CAT ----------
+bool wifiConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.println("[WiFi] Connecting...");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(250); Serial.print("."); }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) { Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP()); return true; }
+  Serial.println("[WiFi] FAILED"); return false;
+}
+
+bool tryConnectHost(const IPAddress& host) {
+  if (cat.connected()) cat.stop();
+  delay(120);
+  const uint16_t backoff[] = {600,1200,2000,3500};
+  for (uint8_t i=0;i<4;i++) {
+    Serial.printf("[CAT] Connecting %s:%u (try %u/4)\n", host.toString().c_str(), CAT_PORT, i+1);
+    if (cat.connect(host, CAT_PORT, TCP_CONNECT_TIMEOUT_MS)) {
+      cat.setNoDelay(true); cat.setTimeout(1200);
+      Serial.println("[CAT] Connected.");
+      return true;
+    }
+    delay(backoff[i]);
+  }
+  return false;
+}
+
+bool catConnect() {
+  String cached = prefs.getString("host", "");
+  if (cached.length()) {
+    IPAddress ip; if (ip.fromString(cached)) {
+      Serial.printf("[CACHE] Trying cached host: %s\n", cached.c_str());
+      if (tryConnectHost(ip)) { currentHost = ip; return true; }
+      Serial.println("[CACHE] Cached host failed.");
+    }
+  }
+  Serial.printf("[CAT] Trying default host: %s\n", CAT_HOST.toString().c_str());
+  if (tryConnectHost(CAT_HOST)) { currentHost = CAT_HOST; return true; }
+
+  Serial.println("[SCAN] Scanning subnet for CAT (TCP 5002) ...");
+  IPAddress found;
+  if (scanFirstOpen(found)) {
+    Serial.printf("[SCAN] Found CAT at %s\n", found.toString().c_str());
+    if (tryConnectHost(found)) { currentHost = found; return true; }
+  }
+  Serial.println("[SCAN] No CAT found.");
+  return false;
+}
+
+void saveCurrentHostIfNeeded() {
+  String cached = prefs.getString("host", "");
+  String nowStr = currentHost.toString();
+  if (cached != nowStr) { prefs.putString("host", nowStr); Serial.printf("[SAVE] Stored CAT host: %s\n", nowStr.c_str()); }
+}
+
+bool readLine(String& out, uint32_t waitMs) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < waitMs) {
+    if (cat.available()) {
+      String s = cat.readStringUntil(';');
+      if (s.length()) { out = s + ';'; return true; }
+    }
+    delay(2); yield();
+  }
+  return false;
+}
+
+bool sendFA(uint32_t hz) {
+  if (!cat.connected()) return false;
+  char digits[16]; snprintf(digits, sizeof(digits), "%011u", hz);
+  char cmd[24];    snprintf(cmd, sizeof(cmd), "FA%s;", digits);
+  Serial.print(">> "); Serial.println(cmd);
+  return cat.print(cmd) == (int)strlen(cmd);
+}
+
+// ----- Filter preset (ZZFI) -----
+bool sendFilterPreset(uint8_t idx) {
+  if (!cat.connected()) return false;
+  if (idx > 7) idx = 7;
+  char cmd[16]; snprintf(cmd, sizeof(cmd), "ZZFI%02u;", idx);
+  Serial.print(">> "); Serial.println(cmd);
+  return cat.print(cmd) == (int)strlen(cmd);
+}
+
+void readFilterPresetOnce() {
+  if (!cat.connected()) return;
+  cat.print("ZZFI;");
+  String line;
+  if (readLine(line, 800) && line.startsWith("ZZFI") && line.endsWith(";") && line.length() >= 6) {
+    filterIdx = line.substring(4, line.length()-1).toInt();
+    if (filterIdx < 0) filterIdx = 0; if (filterIdx > 7) filterIdx = 7;
+    Serial.printf("[FILTER] Current preset = %d\n", filterIdx);
+  } else {
+    Serial.println("[FILTER] No reply; defaulting to 0");
+    filterIdx = 0;
+  }
+}
+
+// ----- Volume (Flex ZZAGnnn; 000..100) -----
+bool setVolumeA(uint8_t lvl) {
+  if (!cat.connected()) return false;
+  if (lvl > 100) lvl = 100;
+  char cmd[16]; snprintf(cmd, sizeof(cmd), "ZZAG%03u;", lvl);
+  Serial.print(">> "); Serial.println(cmd);
+  return cat.print(cmd) == (int)strlen(cmd);
+}
+
+int readVolumeA() {                 // 0..100 or -1
+  if (!cat.connected()) return -1;
+  cat.print("ZZAG;");
+  String line; if (!readLine(line, 800)) return -1;   // expect "ZZAGnnn;"
+  if (!line.startsWith("ZZAG") || !line.endsWith(";")) return -1;
+  return line.substring(4, line.length()-1).toInt();
+}
+
+// ----- Sync VFO from radio -----
+bool initialSyncFromRadio() {
+  if (!cat.connected()) return false;
+  cat.print("FA;");
+  String line;
+  if (!readLine(line, 1500)) return false;
+  if (!line.startsWith("FA") || line.length() < 14) return false;
+  String d = line.substring(2, 13);
+  vfoHz = (uint32_t)d.toInt();
+  lastSentHz = vfoHz;
+  noInterrupts(); q_edges = 0; detentPending = 0; q_last = fastReadAB(); interrupts();
+  Serial.printf("[SYNC] Start at %.6f MHz\n", vfoHz/1e6);
+  return true;
+}
+
+// ----- Incoming CAT pump -----
+void pumpIncoming() {
+  while (cat.connected() && cat.available()) {
+    String s = cat.readStringUntil(';'); if (!s.length()) break; s += ';';
+    if (s == "?;") { Serial.println("<< ?; (ignored)"); }
+    else if (s.startsWith("FA") && s.length() >= 14) {
+      String d = s.substring(2, 13);
+      uint32_t rxHz = (uint32_t)d.toInt();
+      Serial.print("<< "); Serial.println(s);
+      if (rxHz != vfoHz) {
+        vfoHz = rxHz; lastSentHz = rxHz; needResetEncoderBaseline = true;
+        Serial.printf("[EXT] Radio → %.6f MHz (sync)\n", vfoHz/1e6);
+      }
+    } else {
+      Serial.print("<< "); Serial.println(s);
+    }
+  }
+}
+
+// ---------- Arduino ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== ESP32 Flex CAT + Encoder + Auto-Discover + Filter + Volume (ZZAG) ===");
+
+  prefs.begin("cat", false);
+
+  // Main encoder
+  pinMode(PIN_ENC_A, ENC_INPUT_MODE);
+  pinMode(PIN_ENC_B, ENC_INPUT_MODE);
+  q_last = fastReadAB();
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encISR, CHANGE);
+
+  // Filter encoder
+  pinMode(PIN_FILT_A, ENC_INPUT_MODE);
+  pinMode(PIN_FILT_B, ENC_INPUT_MODE);
+  f_q_last = fastReadAB_filt();
+  attachInterrupt(digitalPinToInterrupt(PIN_FILT_A), filtISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_FILT_B), filtISR, CHANGE);
+
+  // Volume encoder
+  pinMode(PIN_VOL_A, ENC_INPUT_MODE);
+  pinMode(PIN_VOL_B, ENC_INPUT_MODE);
+  v_q_last = fastReadAB_vol();
+  attachInterrupt(digitalPinToInterrupt(PIN_VOL_A), volISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_VOL_B), volISR, CHANGE);
+
+  if (!wifiConnect()) { Serial.println("[SYS] Rebooting (WiFi fail)..."); delay(500); ESP.restart(); }
+  if (!catConnect())  { Serial.println("[CAT] Could not connect to CAT. Rebooting..."); delay(500); ESP.restart(); }
+
+  saveCurrentHostIfNeeded();
+
+  if (!initialSyncFromRadio()) { Serial.println("[SYNC] No FA reply; pushing local once."); sendFA(vfoHz); lastSentHz = vfoHz; }
+
+  // Init filter + volume from radio
+  readFilterPresetOnce();
+  int v = readVolumeA(); if (v >= 0) { volumePct = v; Serial.printf("[VOL] %d%%\n", volumePct); }
+}
+
+void loop() {
+  if (cat.connected() && cat.available()) pumpIncoming();
+
+  // reconnect if needed
+  static uint32_t lastTry = 0;
+  if (!cat.connected() && millis() - lastTry > 1200) {
+    lastTry = millis();
+    if (!tryConnectHost(currentHost)) {
+      if (!catConnect()) { Serial.println("[CAT] Reconnect failed; rebooting..."); delay(500); ESP.restart(); }
+    }
+    saveCurrentHostIfNeeded();
+    if (!initialSyncFromRadio()) { sendFA(vfoHz); lastSentHz = vfoHz; }
+    readFilterPresetOnce();
+    int v = readVolumeA(); if (v >= 0) volumePct = v;
+  }
+
+  // External change sync baseline
+  static int32_t lastEdges = 0;
+  if (needResetEncoderBaseline) { noInterrupts(); q_edges = 0; detentPending = 0; interrupts(); needResetEncoderBaseline = false; noInterrupts(); lastEdges = q_edges; interrupts(); }
+
+  // MAIN ENCODER: freq detents + accel
+  int32_t edges; noInterrupts(); edges = q_edges; interrupts();
+  int32_t deltaEdges = edges - lastEdges;
+  int32_t detents = deltaEdges / 4;
+  if (detents != 0) {
+    lastEdges += detents * 4;
+    uint32_t now = millis();
+    uint32_t dt = now - lastDetentMs;
+    int accel = 1; if (dt < ACCEL_T1_MS) accel = 4; else if (dt < ACCEL_T2_MS) accel = 2;
+    long next = (long)vfoHz + (long)detents * STEP_HZ * accel;
+    if (next < 0) next = 0; vfoHz = (uint32_t)next;
+  }
+
+  // Rate-limited FA
+  static uint32_t lastSend = 0;
+  if (cat.connected() && millis() - lastSend >= SEND_INTERVAL_MS) {
+    lastSend = millis();
+    if (vfoHz != lastSentHz) {
+      if (sendFA(vfoHz)) lastSentHz = vfoHz;
+      else if (cat.connected()) cat.stop();
+    }
+  }
+
+  // Light periodic FA;
+  static uint32_t lastFAq = 0;
+  if (RESYNC_MS > 0 && cat.connected() && millis() - lastFAq > RESYNC_MS) { lastFAq = millis(); cat.print("FA;"); }
+
+  // FILTER ENCODER: 4 edges = 1 detent; step 0..7
+  static int32_t f_lastEdges = 0;
+  int32_t fe; noInterrupts(); fe = f_edges; interrupts();
+  int32_t f_delta = fe - f_lastEdges;
+  int32_t f_detents = f_delta / 4;
+  if (f_detents != 0) {
+    f_lastEdges += f_detents * 4;
+    int8_t dir = (f_detents > 0) ? +1 : -1;
+    int8_t newIdx = filterIdx + dir; if (newIdx < 0) newIdx = 0; if (newIdx > 7) newIdx = 7;
+    if (newIdx != filterIdx) { filterIdx = newIdx; sendFilterPreset((uint8_t)filterIdx); }
+  }
+
+  // VOLUME ENCODER: each detent = VOLUME_STEP %, clamp 0..100, throttle sends
+  static int32_t v_lastEdges = 0;
+  static uint32_t lastVolSend = 0;
+  static int16_t  lastVolSent = -1;
+
+  int32_t ve; noInterrupts(); ve = v_edges; interrupts();
+  int32_t v_delta = ve - v_lastEdges;
+  int32_t v_detents = v_delta / 4;
+  if (v_detents != 0) {
+    v_lastEdges += v_detents * 4;
+    int16_t newVol = volumePct + (int16_t)v_detents * VOLUME_STEP;
+    if (newVol < 0) newVol = 0; if (newVol > 100) newVol = 100;
+    volumePct = newVol;
+  }
+  if (cat.connected() && volumePct != lastVolSent && millis() - lastVolSend >= 120) {
+    if (setVolumeA((uint8_t)volumePct)) { lastVolSent = volumePct; lastVolSend = millis(); }
+  }
+
+  delay(1);
+}

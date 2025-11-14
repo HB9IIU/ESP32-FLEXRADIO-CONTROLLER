@@ -1,0 +1,184 @@
+/*
+  ESP32 -> FlexRadio via SmartSDR CAT (TCP 5002)
+  Encoder simulation: step frequency up 20 ticks, then down 20 ticks, repeat.
+  Sends ZZFA with 11-digit Hz format. Prints every command and reply.
+*/
+
+#include <WiFi.h>
+
+// --- your WiFi ---
+const char* ssid = "NO WIFI FOR YOU!!!";
+const char* pass = "Nestle2010Nestle";
+
+// SmartSDR CAT host (Windows PC running SmartSDR CAT TCP 5002)
+const char* catHost = "192.168.0.5";
+const uint16_t catPort = 5002;
+
+// --- tuning simulation settings ---
+static uint32_t vfoHz = 14100000;  // will be updated after first FA reply
+const int32_t  stepHz = 100;       // tuning step per "tick"
+const uint32_t TUNE_INTERVAL_MS = 150;
+const int STEPS_PER_SIDE = 20;
+
+// --- state ---
+WiFiClient cat;
+uint32_t lastSendMs = 0;
+int dir = +1;          // +1 = up, -1 = down
+int stepsDone = 0;     // steps taken in current direction
+
+// ---------- helpers ----------
+bool connectWiFi();
+bool connectCAT();
+void pumpIncoming();
+void parseLine(const String& line);
+void parseFA(const String& line);
+bool sendCAT(const char* cmd);
+bool sendTuneTo(uint32_t hz);
+void requestFA();
+
+// ---------- setup ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("\n=== ESP32 Flex CAT Encoder Simulation ===");
+  Serial.println("[WiFi] Connecting...");
+  if (!connectWiFi()) Serial.println("[WiFi] Failed to connect.");
+
+  Serial.printf("[CAT] Connecting to %s:%u ...\n", catHost, catPort);
+  if (!connectCAT()) {
+    Serial.println("[CAT] Initial connect failed; will retry in loop.");
+  } else {
+    delay(300);
+    requestFA(); // sync starting VFO A
+  }
+}
+
+// ---------- loop ----------
+void loop() {
+  // read any replies
+  if (cat.connected() && cat.available()) pumpIncoming();
+
+  // reconnect if needed
+  static uint32_t lastTry = 0;
+  if (!cat.connected()) {
+    if (millis() - lastTry > 3000) {
+      lastTry = millis();
+      Serial.printf("[CAT] Disconnected. Retrying %s:%u ...\n", catHost, catPort);
+      if (connectCAT()) {
+        delay(300);
+        requestFA();
+      }
+    }
+    return;
+  }
+
+  // simulate encoder ticks: up STEPS_PER_SIDE, then down STEPS_PER_SIDE, repeat
+  if (millis() - lastSendMs >= TUNE_INTERVAL_MS) {
+    lastSendMs = millis();
+
+    // compute next frequency
+    long nextHz = (long)vfoHz + (long)dir * stepHz;
+    if (nextHz < 0) nextHz = 0;
+
+    // send to radio
+    if (sendTuneTo((uint32_t)nextHz)) {
+      vfoHz = (uint32_t)nextHz; // optimistic; will be corrected by FA reply if needed
+      stepsDone++;
+      if (stepsDone >= STEPS_PER_SIDE) {
+        stepsDone = 0;
+        dir = -dir; // reverse direction
+      }
+    }
+  }
+}
+
+// ---------- Wi-Fi ----------
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] Connected. IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  return false;
+}
+
+// ---------- CAT socket ----------
+bool connectCAT() {
+  if (cat.connected()) cat.stop();
+  while (cat.available()) cat.read();
+
+  Serial.printf("[CAT] Opening TCP to %s:%u\n", catHost, catPort);
+  if (!cat.connect(catHost, catPort)) {
+    Serial.println("[CAT] TCP connect() failed.");
+    return false;
+  }
+  cat.setTimeout(1200);  // allow up to ~1.2s per readStringUntil
+  cat.setNoDelay(true);
+  Serial.println("[CAT] Connected.");
+  return true;
+}
+
+// ---------- CAT I/O ----------
+bool sendCAT(const char* cmd) {
+  if (!cat.connected()) {
+    Serial.println("[CAT] sendCAT(): not connected.");
+    return false;
+  }
+  Serial.print(">> ");
+  Serial.println(cmd);
+  size_t n = cat.print(cmd);
+  if (n != strlen(cmd)) {
+    Serial.printf("[CAT] Short write %u/%u\n", (unsigned)n, (unsigned)strlen(cmd));
+    return false;
+  }
+  return true;
+}
+
+void requestFA() { sendCAT("FA;"); }
+
+bool sendTuneTo(uint32_t hz) {
+  // format 11-digit, zero-padded Hz
+  char digits[16];
+  snprintf(digits, sizeof(digits), "%011u", hz);
+
+  // Flex namespace is fine; Kenwood "FA" set also works on many setups
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "ZZFA%s;", digits);
+  return sendCAT(cmd);
+}
+
+void pumpIncoming() {
+  while (cat.connected() && cat.available()) {
+    String line = cat.readStringUntil(';'); // obeys setTimeout
+    if (line.length() == 0) break;
+    line += ';';
+    Serial.print("<< ");
+    Serial.println(line);
+    parseLine(line);
+  }
+}
+
+void parseLine(const String& line) {
+  if (line.startsWith("FA")) parseFA(line);
+  // add other parsers later if you need them
+}
+
+void parseFA(const String& line) {
+  // Expect "FA" + 11 digits + ";"
+  if (line.length() < 14) return;
+  String digits = line.substring(2, 13);
+  uint32_t hz = (uint32_t)digits.toInt();
+  vfoHz = hz; // trust radio as ground truth
+  double mhz = (double)vfoHz / 1e6;
+  Serial.printf("[PARSE] FA -> %s Hz\n", digits.c_str());
+  Serial.printf("[STATE] vfoHz=%u (%.6f MHz)\n", vfoHz, mhz);
+}

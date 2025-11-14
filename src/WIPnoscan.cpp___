@@ -1,0 +1,325 @@
+/*
+  ESP32 -> SmartSDR CAT (Kenwood FA) + Optical Encoder (interrupt, smooth)
+  + Minimal Preferences cache for last successful CAT IP.
+
+  - Tries cached IP first; if it fails, tries CAT_HOST.
+  - On successful connect, saves the IP for next boot.
+
+  A -> GPIO32, B -> GPIO33
+  Counts every edge via ISR; converts to detents (÷4) to avoid jitter.
+  Gentle acceleration based on time between detents.
+
+  Serial: 115200
+*/
+
+#include <WiFi.h>
+#include <Preferences.h>
+
+// ===== YOUR SETTINGS =====
+const char* WIFI_SSID = "NO WIFI FOR YOU!!!";
+const char* WIFI_PASS = "Nestle2010Nestle";
+const IPAddress CAT_HOST(192,168,0,5);   // fallback if no cache / cache fails
+const uint16_t  CAT_PORT = 5002;
+// =========================
+
+const int PIN_ENC_A = 32;   // Encoder A (often GREEN)
+const int PIN_ENC_B = 33;   // Encoder B (often WHITE)
+
+// If your encoder is open-collector, use PULLUP; if push-pull 3V3, use INPUT
+#define ENC_INPUT_MODE INPUT_PULLUP   // change to INPUT if you have strong external drivers
+
+// Base step per detent
+const int32_t  STEP_HZ          = 1;    // 1 Hz per detent (change if you want larger)
+const uint32_t SEND_INTERVAL_MS = 60;   // rate-limit CAT traffic
+const uint32_t RESYNC_MS        = 800;  // periodic FA; to detect external changes (0=off)
+
+// Acceleration thresholds (time between detents)
+const uint32_t ACCEL_T1_MS = 35;  // <35ms → x4
+const uint32_t ACCEL_T2_MS = 80;  // <80ms → x2
+// else x1
+
+WiFiClient cat;
+Preferences prefs;
+IPAddress currentHost = CAT_HOST;
+
+uint32_t vfoHz = 14110000;
+uint32_t lastSentHz = vfoHz;
+
+// ---------- Quadrature decoder (ISR) ----------
+static const int8_t QDEC_TAB[16] = {
+  0, -1, +1,  0,
+ +1,  0,  0, -1,
+ -1,  0,  0, +1,
+  0, +1, -1,  0
+};
+
+volatile uint8_t  q_last = 0;      // last AB (bits: A<<1|B)
+volatile int32_t  q_edges = 0;     // counts all edges (+/-1 per valid transition)
+
+// For acceleration
+volatile uint32_t lastDetentMs = 0;   // time when we completed a full quad step
+volatile int32_t  detentPending = 0;  // edge accumulator to detect full step
+
+// For clean re-zero after external change
+volatile bool needResetEncoderBaseline = false;
+
+inline uint8_t fastReadAB() {
+  return (uint8_t(digitalRead(PIN_ENC_A)) << 1) | uint8_t(digitalRead(PIN_ENC_B));
+}
+
+void IRAM_ATTR encISR() {
+  uint8_t now = fastReadAB();
+  uint8_t idx = (q_last << 2) | now;
+  int8_t d = QDEC_TAB[idx];
+  if (d != 0) {
+    q_edges += d;
+    detentPending += d;
+
+    // One detent = 4 valid transitions
+    if (detentPending >= 4 || detentPending <= -4) {
+      lastDetentMs = millis();
+      detentPending = 0;
+    }
+  }
+  q_last = now;
+}
+
+// ---------- Wi-Fi / CAT ----------
+bool wifiConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.println("[WiFi] Connecting...");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(250); Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+    return true;
+  }
+  Serial.println("[WiFi] FAILED");
+  return false;
+}
+
+bool tryConnectHost(const IPAddress& host) {
+  if (cat.connected()) cat.stop();
+  delay(120);
+  const uint16_t backoff[] = {600,1200,2000,3500};
+  for (uint8_t i=0;i<4;i++) {
+    Serial.printf("[CAT] Connecting %s:%u (try %u/4)\n",
+      host.toString().c_str(), CAT_PORT, i+1);
+    if (cat.connect(host, CAT_PORT)) {
+      cat.setNoDelay(true);
+      cat.setTimeout(1200);
+      Serial.println("[CAT] Connected.");
+      return true;
+    }
+    delay(backoff[i]);
+  }
+  return false;
+}
+
+bool catConnect() {
+  // 1) try cached host, if present
+  String cached = prefs.getString("host", "");
+  if (cached.length() > 0) {
+    IPAddress cachedIP;
+    if (cachedIP.fromString(cached)) {
+      Serial.printf("[CACHE] Trying cached host: %s\n", cached.c_str());
+      if (tryConnectHost(cachedIP)) {
+        currentHost = cachedIP;
+        return true;
+      } else {
+        Serial.println("[CACHE] Cached host failed.");
+      }
+    } else {
+      Serial.printf("[CACHE] Bad cached string: %s\n", cached.c_str());
+    }
+  }
+
+  // 2) try compiled default
+  Serial.printf("[CAT] Trying default host: %s\n", CAT_HOST.toString().c_str());
+  if (tryConnectHost(CAT_HOST)) {
+    currentHost = CAT_HOST;
+    return true;
+  }
+
+  return false;
+}
+
+void saveCurrentHostIfNeeded() {
+  // Save only if different from stored to avoid wear
+  String cached = prefs.getString("host", "");
+  String nowStr = currentHost.toString();
+  if (cached != nowStr) {
+    prefs.putString("host", nowStr);
+    Serial.printf("[SAVE] Stored CAT host: %s\n", nowStr.c_str());
+  }
+}
+
+bool sendFA(uint32_t hz) {
+  if (!cat.connected()) return false;
+  char digits[16]; snprintf(digits, sizeof(digits), "%011u", hz);
+  char cmd[24];    snprintf(cmd, sizeof(cmd), "FA%s;", digits);
+  Serial.print(">> "); Serial.println(cmd);
+  size_t n = cat.print(cmd);
+  return (n == strlen(cmd));
+}
+
+bool readLine(String& out, uint32_t waitMs) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < waitMs) {
+    if (cat.available()) {
+      String s = cat.readStringUntil(';');
+      if (s.length()) { out = s + ';'; return true; }
+    }
+    delay(2); yield();
+  }
+  return false;
+}
+
+// Start at radio's current VFO (FA;)
+bool initialSyncFromRadio() {
+  if (!cat.connected()) return false;
+  cat.print("FA;");
+  String line;
+  if (!readLine(line, 1500)) return false;
+  if (!line.startsWith("FA") || line.length() < 14) return false;
+  String d = line.substring(2, 13);
+  vfoHz = (uint32_t)d.toInt();
+  lastSentHz = vfoHz;
+  noInterrupts(); q_edges = 0; detentPending = 0; q_last = fastReadAB(); interrupts();
+  Serial.printf("[SYNC] Start at %.6f MHz\n", vfoHz/1e6);
+  return true;
+}
+
+// Detect external FA changes
+void pumpIncoming() {
+  while (cat.connected() && cat.available()) {
+    String s = cat.readStringUntil(';');
+    if (!s.length()) break;
+    s += ';';
+    if (s == "?;") {
+      Serial.println("<< ?; (ignored)");
+    } else if (s.startsWith("FA") && s.length() >= 14) {
+      String d = s.substring(2, 13);
+      uint32_t rxHz = (uint32_t)d.toInt();
+      Serial.print("<< "); Serial.println(s);
+      if (rxHz != vfoHz) {
+        vfoHz = rxHz;
+        lastSentHz = rxHz;
+        needResetEncoderBaseline = true;
+        Serial.printf("[EXT] Radio → %.6f MHz (sync)\n", vfoHz/1e6);
+      }
+    } else {
+      Serial.print("<< "); Serial.println(s);
+    }
+  }
+}
+
+// ---------- Arduino ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== ESP32 Flex CAT + Optical Encoder (interrupt, smooth + sync + cache) ===");
+
+  prefs.begin("cat", false);  // RW namespace "cat"
+
+  pinMode(PIN_ENC_A, ENC_INPUT_MODE);
+  pinMode(PIN_ENC_B, ENC_INPUT_MODE);
+
+  // Initialize last state and attach interrupts on BOTH pins
+  q_last = fastReadAB();
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encISR, CHANGE);
+
+  if (!wifiConnect()) return;
+
+  if (!catConnect()) {
+    Serial.println("[CAT] Could not connect to CAT.");
+    return;
+  }
+
+  saveCurrentHostIfNeeded();        // remember the working host
+
+  // Try to start from radio's current VFO; if not, push our local once
+  if (!initialSyncFromRadio()) {
+    Serial.println("[SYNC] No FA reply; pushing local once.");
+    sendFA(vfoHz);
+    lastSentHz = vfoHz;
+  }
+}
+
+void loop() {
+  if (cat.connected() && cat.available()) pumpIncoming();
+
+  // reconnect if needed (using currentHost first, then cache/default via catConnect)
+  static uint32_t lastTry = 0;
+  if (!cat.connected() && millis() - lastTry > 1200) {
+    lastTry = millis();
+
+    // first: try the same host again
+    if (!tryConnectHost(currentHost)) {
+      // fallback to cached/default sequence
+      if (!catConnect()) return;
+    }
+    saveCurrentHostIfNeeded();
+    if (!initialSyncFromRadio()) { sendFA(vfoHz); lastSentHz = vfoHz; }
+  }
+
+  // If radio changed externally, re-zero encoder delta once
+  static bool cleared = false;
+  if (needResetEncoderBaseline) {
+    noInterrupts(); q_edges = 0; detentPending = 0; interrupts();
+    needResetEncoderBaseline = false;
+    cleared = true;
+  } else {
+    cleared = false;
+  }
+
+  // Convert edges to detents (÷4), apply step + gentle acceleration
+  static int32_t lastEdges = 0;
+  if (cleared) { // keep delta clean after external sync
+    noInterrupts(); lastEdges = q_edges; interrupts();
+  }
+
+  int32_t edges;
+  noInterrupts(); edges = q_edges; interrupts();
+  int32_t deltaEdges = edges - lastEdges;
+
+  int32_t detents = deltaEdges / 4;           // whole detents since last time
+  lastEdges += detents * 4;                    // keep remainder for next loop
+
+  if (detents != 0) {
+    uint32_t now = millis();
+    uint32_t dt = now - lastDetentMs;  // lastDetentMs is updated in ISR
+
+    int accel = 1;
+    if      (dt < ACCEL_T1_MS) accel = 4;     // very fast spin
+    else if (dt < ACCEL_T2_MS) accel = 2;     // medium spin
+
+    long next = (long)vfoHz + (long)detents * STEP_HZ * accel;
+    if (next < 0) next = 0;
+    vfoHz = (uint32_t)next;
+  }
+
+  // Rate-limited send
+  static uint32_t lastSend = 0;
+  if (cat.connected() && millis() - lastSend >= SEND_INTERVAL_MS) {
+    lastSend = millis();
+    if (vfoHz != lastSentHz) {
+      if (sendFA(vfoHz)) lastSentHz = vfoHz;
+      else if (cat.connected()) cat.stop();
+    }
+  }
+
+  // Very light periodic FA; to notice mouse-driven changes
+  static uint32_t lastFAq = 0;
+  if (RESYNC_MS > 0 && cat.connected() && millis() - lastFAq > RESYNC_MS) {
+    lastFAq = millis();
+    cat.print("FA;");
+  }
+
+  delay(1);
+}
