@@ -166,10 +166,10 @@ The project uses a custom helper:
 
 <table>
   <tr>
-    <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_1.png" width="50%"></td>
-    <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_2.png" width="50%"></td>
-    <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_3.png" width="50%"></td>
-    <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_4.png" width="50%"></td>
+    <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_1.png"></td>
+    <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_2.png"></td>
+    <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_3.png"></td>
+    <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_4.png"></td>
   </tr>
   <tr>
     <td><img src="doc/3D_Renderings/HB9IIU_FlexController_Rendering_5.png" width="24%"></td>
