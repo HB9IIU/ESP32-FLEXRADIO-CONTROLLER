@@ -9,8 +9,11 @@ namespace HB9IIUPortal
     // Call every loop()
     void loop();                  // handles WebServer + DNS when in AP mode
 
-    // Optional factory reset
-    void eraseAllPreferences();   // clears wifi/config/iPhonetime NVS namespaces
+    //  factory reset
+    void eraseAllPreferencesAndRestart();   // clears wifi/config/iPhonetime NVS namespaces
+
+    // check factory reset at boot using an already-configured button + LED
+    bool checkFactoryReset(uint8_t buttonPin, uint8_t ledPin);
 
     // State helpers
     bool isInAPMode();            // true when captive portal is running

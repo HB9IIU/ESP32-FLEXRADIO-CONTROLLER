@@ -1,0 +1,126 @@
+#include <Arduino.h>
+#include "HB9IIUWebConsoleLogger.h"
+#include <HB9IIUportalConfigurator.h>
+#include "HB9IIUOtaHelper.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+const int PIN_LED_RED_RESET = 4;
+const int PIN_FACTORY_RESET_SW = 17;
+const char *OTA_HOSTNAME = "flexcontroller"; // should match with platformio.ini
+
+WebServer server(80);
+
+// ===== LED BLINK TASK STUFF =====
+TaskHandle_t ledBlinkTaskHandle = nullptr;
+volatile bool ledBlinkActive = false;
+
+void ledBlinkTask(void *parameter)
+{
+  pinMode(PIN_LED_RED_RESET, OUTPUT);
+  bool state = false;
+
+  for (;;)
+  {
+    if (ledBlinkActive)
+    {
+      digitalWrite(PIN_LED_RED_RESET, state ? HIGH : LOW);
+      state = !state;
+      vTaskDelay(pdMS_TO_TICKS(200)); // blink every 200 ms
+    }
+    else
+    {
+      // make sure LED is off when not active
+      digitalWrite(PIN_LED_RED_RESET, LOW);
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+}
+
+// ================== SETUP ========================
+void setup()
+{
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("Booting...");
+  logPrintln("ESP32 OTA + Log server starting...");
+
+  // Factory Reset Pins Configuration
+  pinMode(PIN_FACTORY_RESET_SW, INPUT_PULLUP);
+  pinMode(PIN_LED_RED_RESET, OUTPUT);
+  digitalWrite(PIN_LED_RED_RESET, LOW);
+
+  // Factory reset may erase NVS and reboot
+  HB9IIUPortal::checkFactoryReset(PIN_FACTORY_RESET_SW, PIN_LED_RED_RESET);
+
+  // --- Start LED blink task (for the rest of setup) ---
+  xTaskCreatePinnedToCore(
+      ledBlinkTask,        // task function
+      "LEDBlink",          // name
+      2048,                // stack size
+      nullptr,             // parameter
+      1,                   // priority
+      &ledBlinkTaskHandle, // handle
+      1);                  // core (0 or 1, doesn’t matter much here)
+
+  ledBlinkActive = true; // start blinking
+
+  // Connect if possible, else start captive portal
+  HB9IIUPortal::begin();
+
+  // If we reach here: WiFi is configured (STA or AP mode is decided)
+  if (!HB9IIUPortal::isInAPMode())
+  {
+    logPrintln("WiFi connected.");
+    logPrintln("IP address: " + WiFi.localIP().toString());
+
+    // Init web console logger (routes + handlers)
+    WebConsoleLogger_begin(server, consoleHTML);
+
+    // Start HTTP server
+    server.begin();
+    logPrintln("HTTP server started.");
+
+    // Setup OTA
+    OtaHelper::begin(OTA_HOSTNAME);
+  }
+
+  // --- Stop LED blinking at end of setup() ---
+  ledBlinkActive = false;
+  if (ledBlinkTaskHandle != nullptr)
+  {
+    vTaskDelete(ledBlinkTaskHandle);
+    ledBlinkTaskHandle = nullptr;
+  }
+  digitalWrite(PIN_LED_RED_RESET, LOW); // ensure off
+}
+
+// ================== LOOP =========================
+void loop()
+{
+  HB9IIUPortal::loop(); // MUST be called every loop()
+
+  if (!HB9IIUPortal::isInAPMode())
+  {
+    server.handleClient(); // Handle web requests
+    OtaHelper::handle();   // Handle OTA updates
+
+    // ✅ Normal application code here – WiFi connected
+    static unsigned long lastLog = 0;
+    if (millis() - lastLog > 5000)
+    {
+      lastLog = millis();
+      logPrintln("Waiting in NORMAL mode: " + String(millis() / 1000));
+    }
+  }
+  else
+  {
+    // Captive-portal mode
+    static unsigned long lastLog = 0;
+    if (millis() - lastLog > 1000)
+    {
+      lastLog = millis();
+      logPrintln("Waiting in CAPTIVE PORTAL mode for Wifi Credentials: " + String(millis() / 1000));
+    }
+  }
+}

@@ -5,7 +5,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
-
+#include "nvs_flash.h"
 #include "config_page.h"  // const char index_html[] PROGMEM = "..."
 #include "success_page.h" // const char html_success[] PROGMEM = "..."
 
@@ -59,27 +59,81 @@ namespace HB9IIUPortal
         }
     }
 
-    void eraseAllPreferences()
+    bool checkFactoryReset(uint8_t buttonPin, uint8_t ledPin)
     {
-        const char *namespaces[] = {
-            "wifi",      // SSID + password
-            "config",    // API key, other config
-            "iPhonetime" // phone time info
-        };
+        // Assume pinMode(buttonPin, INPUT_PULLUP) and pinMode(ledPin, OUTPUT)
+        // have already been called in the main sketch.
 
-        const size_t count = sizeof(namespaces) / sizeof(namespaces[0]);
+        digitalWrite(ledPin, LOW);
+        Serial.println("\n[BOOT] Checking factory reset button...");
 
-        Serial.println("🧹 [HB9IIUPortal] Erasing all stored Preferences…");
+        // Small settling delay for the pin
+        delay(50);
 
-        for (size_t i = 0; i < count; i++)
+        if (digitalRead(buttonPin) == LOW)
         {
-            Serial.printf("   ➤ Clearing namespace \"%s\"…\n", namespaces[i]);
-            prefs.begin(namespaces[i], false);
-            prefs.clear();
-            prefs.end();
-        }
+            digitalWrite(ledPin, HIGH);
+            Serial.println("⚠️ Factory reset button detected LOW at boot.");
+            Serial.println("   Hold the button to confirm reset...");
 
-        Serial.println("✅ [HB9IIUPortal] All known Preferences namespaces cleared.");
+            const unsigned long confirmMs = 1000;
+            unsigned long t0 = millis();
+            bool stillPressed = true;
+
+            while (millis() - t0 < confirmMs)
+            {
+                if (digitalRead(buttonPin) != LOW)
+                {
+                    stillPressed = false;
+                    break;
+                }
+                delay(10); // simple debounce / sampling interval
+            }
+
+            if (stillPressed)
+            {
+                Serial.println("✅ Factory reset confirmed. Erasing NVS...");
+
+                // 🔴 Blink fast 10 times
+                for (int i = 0; i < 10; i++)
+                {
+                    digitalWrite(ledPin, HIGH);
+                    delay(100);
+                    digitalWrite(ledPin, LOW);
+                    delay(100);
+                }
+
+                // This will not return
+                eraseAllPreferencesAndRestart();
+            }
+            else
+            {
+                digitalWrite(ledPin, LOW);
+                Serial.println("❎ Button released, aborting factory reset.");
+            }
+
+            return false; // no reset, just aborted
+        }
+        else
+        {
+            Serial.println("No factory reset requested.");
+            return false;
+        }
+    }
+
+    void eraseAllPreferencesAndRestart()
+    {
+        esp_err_t err = nvs_flash_erase(); // 💣 Erases the entire NVS partition!
+        if (err == ESP_OK)
+        {
+            Serial.println("🧹 All NVS data erased (Preferences). Restarting...");
+            delay(1000);
+            ESP.restart();
+        }
+        else
+        {
+            Serial.printf("⚠️ NVS erase failed: %s\n", esp_err_to_name(err));
+        }
     }
 
     bool isInAPMode()
@@ -93,14 +147,22 @@ namespace HB9IIUPortal
     }
 
     // ───────── INTERNAL IMPLEMENTATION ─────────
-
     static bool tryToConnectSavedWiFi()
     {
         Serial.println("🔍 [HB9IIUPortal] Attempting to load saved WiFi credentials...");
 
-        if (!prefs.begin("wifi", true))
+        // Use read-write (false) so the namespace is created silently if missing
+        if (!prefs.begin("wifi", false))
         {
-            Serial.println("⚠️ [HB9IIUPortal] NVS namespace 'wifi' not found.");
+            Serial.println("⚠️ [HB9IIUPortal] Failed to open NVS namespace 'wifi'.");
+            return false;
+        }
+
+        // Check if the keys are present
+        if (!prefs.isKey("ssid") || !prefs.isKey("pass"))
+        {
+            Serial.println("⚠️  [HB9IIUPortal] No saved credentials found (keys missing).");
+            prefs.end();
             return false;
         }
 
@@ -112,6 +174,7 @@ namespace HB9IIUPortal
             ssid = ssid.substring(0, parenIndex);
             ssid.trim(); // remove trailing space
         }
+
         String pass = prefs.getString("pass", "");
         prefs.end();
 
@@ -121,10 +184,10 @@ namespace HB9IIUPortal
             return false;
         }
 
-        Serial.printf("📡 Found SSID: %s\n", ssid.c_str());
-        Serial.printf("🔐 Found Password: %s\n", pass.c_str());
+        Serial.printf("[HB9IIUPortal] 📡 Found SSID: %s\n", ssid.c_str());
+        Serial.printf("[HB9IIUPortal] 🔐 Found Password: %s\n", pass.c_str());
 
-        Serial.printf("🔌 Connecting to WiFi: %s...\n", ssid.c_str());
+        Serial.printf("[HB9IIUPortal]🔌 Connecting to WiFi: %s", ssid.c_str());
         WiFi.mode(WIFI_STA);
         WiFi.begin(ssid.c_str(), pass.c_str());
 
@@ -132,6 +195,7 @@ namespace HB9IIUPortal
         {
             if (WiFi.status() == WL_CONNECTED)
             {
+                Serial.println();
                 Serial.println("✅ [HB9IIUPortal] Connected to WiFi!");
                 Serial.print("📶 IP Address: ");
                 Serial.println(WiFi.localIP());
@@ -141,13 +205,15 @@ namespace HB9IIUPortal
             delay(500);
         }
 
-Serial.println("\n❌ [HB9IIUPortal] Failed to connect to saved WiFi.");
-WiFi.disconnect(true);           // optional, but nice to be clean
+        Serial.println("\n❌ [HB9IIUPortal] Failed to connect to saved WiFi.");
+        WiFi.disconnect(true); // optional, but nice to be clean
 
-Serial.println("🔁 Rebooting ESP32 in 2 seconds...");
-delay(2000);                     // give time for the message to flush
+        Serial.println("🔁 Rebooting ESP32 in 2 seconds...");
+        delay(2000); // give time for the message to flush
 
-ESP.restart();                   // Arduino-style restart
+        ESP.restart();
+
+        return false; // never reached
     }
 
     static void startConfigurationPortal()
