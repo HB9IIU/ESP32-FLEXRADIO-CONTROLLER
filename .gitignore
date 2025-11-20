@@ -25,3 +25,5 @@ apikey
 # JetBrains IDE (IntelliJ / CLion / PyCharm / etc.)
 .idea/
 *.iml
+
+/snippetsNOTGITTED/
