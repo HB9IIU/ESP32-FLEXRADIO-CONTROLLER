@@ -185,10 +185,10 @@ The project uses a custom helper:
 
 <table>
   <tr>
-    <td><img src="pictures/HB9IIU_FlexController_As_Build_1"></td>
-    <td><img src="pictures/HB9IIU_FlexController_As_Build_2"></td>
-    <td><img src="pictures/HB9IIU_FlexController_As_Build_3"></td>
-    <td><img src="pictures/HB9IIU_FlexController_As_Build_4"></td>
+    <td><img src="doc/pictures/HB9IIU_FlexController_As_Build_1.png"></td>
+    <td><img src="doc/pictures/HB9IIU_FlexController_As_Build_2.png"></td>
+    <td><img src="doc/pictures/HB9IIU_FlexController_As_Build_3.png"></td>
+    <td><img src="doc/pictures/HB9IIU_FlexController_As_Build_4.png"></td>
   </tr>   
 
 </table>
