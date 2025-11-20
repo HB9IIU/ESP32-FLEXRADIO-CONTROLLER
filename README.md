@@ -64,9 +64,9 @@ It talks to the SmartSDR CAT server over TCP (port 5002) and gives you a **hardw
 ## Hardware
 
 - **ESP32 board** (classic ESP32 DevKit-style with GPIOs 32/33 etc.)
-- Main VFO: high-resolution E38 optical encoder (600 PPR, NPN, powered at 5 V with A/B pulled up to 3.3 V on the ESP32).
-- Filter & volume: two HW-040 mechanical encoder modules with integrated push switches (volume switch also used for mute / factory reset).
-- 5× **TTP223 touch sensors** (or similar)
+- Main VFO: high-resolution E38 optical encoder (600 PPR, NPN, powered at 5 V, A/B pulled up to 3.3 V on the ESP32).
+- Filter & volume: two HW-040 mechanical encoders with integrated push switches (volume switch also used for mute / factory reset).
+- 5× **TTP223 touch sensors** 
 - 2× LEDs (GREEN, RED) for status and TX indication
 - 1× **factory-reset / volume encoder** push button
 - 3D-printed enclosure (STL/STEP files in this repo)
@@ -102,13 +102,14 @@ Encoder common pins go to **GND**.
 | Encoder B  | **33**     | Quadrature B                   |
 | Push (BW)  | **16**     | Active-LOW, internal pull-up   |
 
-#### Filter Encoder
+#### Filter / BW Encoder
 
-| Signal    | ESP32 GPIO | Notes                                    |
-| --------- | ---------- | ---------------------------------------- |
-| Encoder A | **32**     | Quadrature A                             |
-| Encoder B | **33**     | Quadrature B                             |
-| Push      | **16**     | Active-LOW, used to reboot the ESP32     |
+| Signal    | ESP32 GPIO | Notes                                            |
+| --------- | ---------- | -------------------------------------------------|
+| Encoder A | **26**     | Quadrature A                                     |
+| Encoder B | **25**     | Quadrature B                                     |
+| Push (BW) | **16**     | Active-LOW, used to reboot the ESP32 (BW button) |
+
 
 #### Volume Encoder
 
@@ -181,7 +182,7 @@ The project uses a custom helper:
 
 ---
 
-### As Build
+### As-Built
 
 <table>
   <tr>
@@ -194,6 +195,22 @@ The project uses a custom helper:
 </table>
 
 ---
+## Known Limitations & Notes
+
+- **SmartSDR reconnect behaviour**  
+  If you **power off the device while SmartSDR is running**, the controller can reconnect, but SmartSDR sometimes stops reacting to it until you **restart SmartSDR**.  
+  If you instead do a **soft restart** of the controller by clicking the **BW (filter) encoder** (which reboots the ESP32), SmartSDR continues to work normally without needing a restart.
+
+- **Touch sensor sensitivity**  
+  The TTP223 touch sensors are very sensitive through the front panel. With the current enclosure wall thickness, they can sometimes trigger even when a finger is **2–3 mm away** from the plastic.  
+  If I were to redesign the enclosure, I would **increase the thickness** in the touch sensor area (or reduce sensitivity) to make accidental triggers less likely.
+
+## Final Notes
+
+This is a hobby project built by an amateur coder and radio tinkerer – expect a few quirks and feel free to hack it to your needs.  
+Have fun experimenting, modifying and improving the controller… and if you build your own version, I’d be happy to see it!
+
+73 de HB9IIU
 
 ## License
 
